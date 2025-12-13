@@ -113,8 +113,8 @@ class UavVecWorld:
 
     This class does NOT implement any learning or optimization.
     You call `step()` with your own decision about:
-      - which RSU the UAV serves (k or None)
-      - what fraction of that RSU's workload to offload in this slot
+      - which RSU(s) each UAV serves
+      - what fraction of that RSU's workload each UAV offloads
     and it will simulate task arrivals, transmission, computing, and energy.
     """
 
@@ -122,7 +122,7 @@ class UavVecWorld:
         self,
         vehicles: List[Vehicle],
         rsus: List[RSU],
-        uav: UAV,
+        uavs: List[UAV],                      
         delta_t: float,
         rsu_capacity_threshold: float,
         uplink_power_ue: float,
@@ -131,10 +131,10 @@ class UavVecWorld:
     ):
         self.vehicles = vehicles
         self.rsus = rsus
-        self.uav = uav
+        self.uavs = uavs                     
 
-        self.delta_t = delta_t     # slot duration Δ (seconds)
-        self.rsu_capacity_threshold = rsu_capacity_threshold  # overload threshold (cycles / slot)
+        self.delta_t = delta_t
+        self.rsu_capacity_threshold = rsu_capacity_threshold
         self.uplink_power_ue = uplink_power_ue
         self.uplink_noise_ue = uplink_noise_ue
         self.rsu_radius = rsu_radius
@@ -145,71 +145,64 @@ class UavVecWorld:
 
     def reset(self):
         self.t = 0
-        self.uav.E_batt = self.uav.E_max
+        for uav in self.uavs:               
+            uav.E_batt = uav.E_max
         for rsu in self.rsus:
             rsu.reset_slot()
 
     def step(self, action: Dict) -> Dict:
         """
-        Simulate one slot.
+        action format :
 
-        action:
-          {
-            "target_rsu": Optional[int],   # RSU index or None (no service)
-            "offload_ratio": float in [0,1]  # fraction of overloaded workload to offload
-          }
-
-        Returns a dict with delays, energies, and bookkeeping.
+        {
+          rsu_id: {
+              uav_id: offload_ratio,
+              ...
+          },
+          ...
+        }
         """
         self.t += 1
 
-        # --- 1. Harvest energy at beginning of slot ---
-        e_harvest = self.uav.harvest_energy()
+        # --- 1. Harvest energy ---
+        for uav in self.uavs:                 
+            uav.harvest_energy()
 
-        # --- 2. New vehicular task arrivals and V2I transmission to RSUs ---
+        # --- 2. Vehicular uploads ---
         veh_stats = self._simulate_vehicular_uploads()
-
-        # determine overloaded RSUs
         overloaded_indices = self._get_overloaded_rsus()
 
-        # --- 3. UAV-assisted offloading for chosen RSU ---
-        target_rsu = action.get("target_rsu", None)
-        offload_ratio = float(np.clip(action.get("offload_ratio", 0.0), 0.0, 1.0))
+        # --- 3. UAV-assisted offloading (multi-UAV, cooperative) ---
+        uav_results = {uav.uid: [] for uav in self.uavs}   
 
-        uav_result = {
-            "served_rsu": None,
-            "offloaded_cycles_cpu": 0.0,
-            "offloaded_cycles_gpu": 0.0,
-            "offloaded_bits": 0.0,
-            "T_uav_trans": 0.0,
-            "T_uav_comp": 0.0,
-            "T_uav_output": 0.0,
-            "E_comp": 0.0,
-            "E_hover": 0.0,
-            "E_fly": 0.0,
-            "E_total": 0.0
-        }
+        for rsu_id, uav_dict in action.items():            
+            if rsu_id not in overloaded_indices:
+                continue
 
-        if target_rsu is not None and target_rsu in overloaded_indices:
-            uav_result = self._simulate_uav_offloading(target_rsu, offload_ratio)
+            for uav_id, offload_ratio in uav_dict.items():
+                offload_ratio = float(np.clip(offload_ratio, 0.0, 1.0))
+                uav = self.uavs[uav_id]
 
-        # --- 4. RSU local computing & queue delay, output to vehicles ---
-        rsu_stats = self._simulate_rsu_processing(uav_result)
+                result = self._simulate_uav_offloading(
+                    uav=uav,                              
+                    rsu_id=rsu_id,
+                    offload_ratio=offload_ratio
+                )
 
-        # --- 5. Pack results ---
-        world_info = {
+                if result is not None:
+                    uav_results[uav_id].append(result)
+
+        # --- 4. RSU local processing ---
+        rsu_stats = self._simulate_rsu_processing(None)
+
+        return {
             "time_slot": self.t,
             "veh_stats": veh_stats,
-            "uav_result": uav_result,
+            "uav_results": uav_results,      
             "rsu_stats": rsu_stats,
-            "uav_energy": {
-                "E_batt": self.uav.E_batt,
-                "harvested": e_harvest
-            },
+            "uav_energy": {uav.uid: uav.E_batt for uav in self.uavs},
             "overloaded_rsus": overloaded_indices
         }
-
-        return world_info
 
     # ---------- Internal methods ----------
 
@@ -295,82 +288,62 @@ class UavVecWorld:
                 overloaded.append(rsu.rid)
         return overloaded
 
-    def _simulate_uav_offloading(self, rsu_id: int, offload_ratio: float) -> Dict:
+    def _simulate_uav_offloading(self, uav: UAV, rsu_id: int, offload_ratio: float) -> Dict:
         """
-        Simulate UAV assisting one overloaded RSU.
-        1) UAV flies to RSU location (if not already there).
-        2) A fraction of RSU workload is offloaded.
-        3) Compute TX delay RSU->UAV, UAV compute, UAV->RSU output, and energies.
+        Simulate ONE UAV assisting ONE RSU.
+        Multiple UAVs can call this for the same RSU in the same slot.
         """
         rsu = self.rsus[rsu_id]
-        uav_xy = np.array([self.uav.x, self.uav.y])
-        rsu_xy = np.array([rsu.x, rsu.y])
-
-        E_fly = self.uav.move_to(rsu.x, rsu.y, self.delta_t)
 
         total_equiv = rsu.workload_cycles + rsu.workload_gpu_ops
+        if total_equiv <= 0:
+            return None
+
         d_total = rsu.workload_bits
         offload_equiv = offload_ratio * total_equiv
-        # proportion GPU in RSU workload:
-        gpu_share = 0.0
-        if total_equiv > 0:
-            gpu_share = rsu.workload_gpu_ops / total_equiv
 
+        gpu_share = rsu.workload_gpu_ops / max(total_equiv, 1e-9)
         c_k_gpu = offload_equiv * gpu_share
         c_k_cpu = offload_equiv * (1.0 - gpu_share)
         d_k = offload_ratio * d_total
 
+        # --- UAV flight ---
+        E_fly = uav.move_to(rsu.x, rsu.y, self.delta_t)
+
+        # --- RSU --> UAV transmission ---
         g_uk = uav_rsu_channel_gain(
-            mu1=self.uav.mu1, mu2=self.uav.mu2, H=self.uav.H, H0=self.uav.H0,
-            g0=self.uav.g0, zeta=self.uav.zeta,
-            uav_xy=uav_xy, rsu_xy=rsu_xy
+            mu1=uav.mu1, mu2=uav.mu2, H=uav.H, H0=uav.H0,
+            g0=uav.g0, zeta=uav.zeta,
+            uav_xy=np.array([uav.x, uav.y]),
+            rsu_xy=np.array([rsu.x, rsu.y])
         )
 
-        B_uk = rsu.bandwidth
-        P_uk = rsu.tx_power
-        sigma2 = rsu.noise_power
-        r_uk = shannon_rate(B_uk, P_uk, g_uk, sigma2)
-
+        r_uk = shannon_rate(rsu.bandwidth, rsu.tx_power, g_uk, rsu.noise_power)
         T_trans = d_k / r_uk if r_uk > 0 else 1e6
 
-        # UAV GPU processing
-        T_gpu = 0.0; E_gpu = 0.0
-        if self.uav.gpu_flops > 0 and c_k_gpu > 0:
-            # interpret c_k_gpu as GPU-FLOP-equivalent
-            T_gpu, E_gpu = gpu_processing_time_and_energy(c_k_gpu, self.uav.gpu_flops, self.uav.gpu_power_active)
+        # --- UAV computing ---
+        T_gpu, E_gpu = gpu_processing_time_and_energy(c_k_gpu, uav.gpu_flops, uav.gpu_power_active)
+        T_cpu, E_cpu = cpu_processing_time_and_energy(c_k_cpu, uav.f_u, uav.energy_coeff)
 
-        # UAV CPU processing
-        T_cpu, E_cpu = cpu_processing_time_and_energy(c_k_cpu, self.uav.f_u, self.uav.energy_coeff)
-
-        # assume CPU & GPU process their partitions in parallel
         T_comp = max(T_gpu, T_cpu)
         E_comp = E_gpu + E_cpu
 
+        # --- Output ---
         o_t = 0.1
-        d_out = o_t * d_k
-        r_out = r_uk
-        T_out = d_out / r_out if r_out > 0 else 1e6
+        T_out = (o_t * d_k) / max(r_uk, 1e-9)
 
-        T_hover_total = T_trans + T_comp + T_out
-        E_hover = self.uav.hover_power * T_hover_total
-
+        E_hover = uav.hover_power * (T_trans + T_comp + T_out)
         E_total = E_fly + E_comp + E_hover
 
-        # Clip if battery insufficient: scale down proportionally
-        if not self.uav.can_afford(E_total):
-            scale = self.uav.E_batt / max(E_total, 1e-9)
-            E_fly *= scale
-            E_comp *= scale
-            E_hover *= scale
-            E_total = self.uav.E_batt
+        if not uav.can_afford(E_total):
+            return None
 
-        self.uav.spend_energy(E_total)
+        uav.spend_energy(E_total)
 
-        # subtract offloaded workload from RSU
-        # prefer removing GPU ops then CPU cycles proportionally to offload
-        rsu.workload_gpu_ops = max(0.0, rsu.workload_gpu_ops - c_k_gpu)
-        rsu.workload_cycles = max(0.0, rsu.workload_cycles - c_k_cpu)
-        rsu.workload_bits = max(0.0, rsu.workload_bits - d_k)
+        # --- Subtract ONLY this UAV's share ---
+        rsu.workload_gpu_ops -= c_k_gpu
+        rsu.workload_cycles -= c_k_cpu
+        rsu.workload_bits -= d_k
 
         return {
             "served_rsu": rsu_id,
@@ -385,6 +358,7 @@ class UavVecWorld:
             "E_fly": E_fly,
             "E_total": E_total
         }
+
 
     def _simulate_rsu_processing(self, uav_result: Dict) -> Dict:
         """
@@ -433,7 +407,6 @@ class UavVecWorld:
             "T_queue_rsu": rsu_queue_delay,
             "T_output_rsu": rsu_output_delay
         }
-
 
 # ===========================================
 # TODO: Create a gym.Env class to simulate UAV world
