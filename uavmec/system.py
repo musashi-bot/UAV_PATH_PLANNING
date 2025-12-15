@@ -152,14 +152,16 @@ class UavVecWorld:
 
     def step(self, action: Dict) -> Dict:
         """
-        action format :
-
+         action format:
         {
-          rsu_id: {
-              uav_id: offload_ratio,
-              ...
-          },
-          ...
+        "coalitions": {
+            coalition_id: [uav_id_1, uav_id_2, ...],
+            ...
+        },
+        "rsu_assignment": {
+            rsu_id: coalition_id,
+            ...
+        }
         }
         """
         self.t += 1
@@ -175,18 +177,43 @@ class UavVecWorld:
         # --- 3. UAV-assisted offloading (multi-UAV, cooperative) ---
         uav_results = {uav.uid: [] for uav in self.uavs}   
 
-        for rsu_id, uav_dict in action.items():            
+
+        coalitions = action.get("coalitions", {})
+        rsu_assignment = action.get("rsu_assignment", {})
+
+        for rsu_id, coalition_id in rsu_assignment.items():
+
+            # RSU must be overloaded
             if rsu_id not in overloaded_indices:
                 continue
 
-            for uav_id, offload_ratio in uav_dict.items():
-                offload_ratio = float(np.clip(offload_ratio, 0.0, 1.0))
+            # Coalition must exist
+            if coalition_id not in coalitions:
+                continue
+
+            coalition = coalitions[coalition_id]
+            if len(coalition) == 0:
+                continue
+
+            # ---- Offload ALL possible workload for now ----
+            # (world rule: equal split among coalition members)
+            beta_k = 1.0
+
+            per_uav_ratio = beta_k / len(coalition)
+
+            # Sequentially let coalition members peel off workload
+            for uav_id in coalition:
+
+                # Safety: UAV id must be valid
+                if uav_id < 0 or uav_id >= len(self.uavs):
+                    continue
+
                 uav = self.uavs[uav_id]
 
                 result = self._simulate_uav_offloading(
-                    uav=uav,                              
+                    uav=uav,
                     rsu_id=rsu_id,
-                    offload_ratio=offload_ratio
+                    offload_ratio=per_uav_ratio
                 )
 
                 if result is not None:
