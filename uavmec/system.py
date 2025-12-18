@@ -89,10 +89,31 @@ class UAV:
 
     def move_to(self, new_x: float, new_y: float, delta_t: float) -> float:
         """Move UAV, return flight energy for this slot."""
-        dist = np.linalg.norm(np.array([new_x - self.x, new_y - self.y]))
-        v = dist / max(delta_t, 1e-6)
+        v_max = 25.0  # m/s (maximum UAV speed)
+
+        current_pos = np.array([self.x, self.y])
+        target_pos = np.array([new_x, new_y])
+
+        direction = target_pos - current_pos
+        dist = np.linalg.norm(direction)
+
+        # maximum distance UAV can travel this slot
+        max_dist = v_max * delta_t
+
+        if dist <= max_dist:
+            # UAV reaches the target
+            new_pos = target_pos
+            v = dist / max(delta_t, 1e-6)
+        else:
+            # UAV moves toward target but cannot reach
+            direction_unit = direction / max(dist, 1e-9)
+            new_pos = current_pos + direction_unit * max_dist
+            v = v_max
+
         self.last_v = v
-        self.x, self.y = new_x, new_y
+        self.x, self.y = new_pos
+
+        # propulsion energy
         E_fly = self.fly_coeff * (v ** 2)
         return E_fly
 

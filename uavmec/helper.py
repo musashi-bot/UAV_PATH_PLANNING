@@ -5,7 +5,7 @@ from typing import List, Dict, Optional, Tuple
 # ======================================
 # Helper functions (channel etc.)
 # ======================================
-
+np.random.seed(42)
 def poisson_arrivals(lam: float) -> int:
     """Sample Poisson arrivals for a given rate λ."""
     return np.random.poisson(lam)
