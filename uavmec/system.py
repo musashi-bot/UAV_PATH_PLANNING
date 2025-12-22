@@ -14,10 +14,23 @@ class Vehicle:
     lam: float               # Poisson arrival rate λ_v (tasks / slot)
     c_per_task: float        # CPU cycles per task
     d_per_task: float        # bits per task
-    rsu_id: int              # which RSU covers this vehicle (simple mapping)
+    trajectory:np.ndarray              # trajectory followed by vehicle
+    t_idx: int =0            #timestamp
+    x: float=0.0                #coordinates
+    y: float=0.0
     gpu_frac:float = 0.0
     # runtime stats (not required but helpful)
     last_generated_tasks: int = 0
+    def step(self):
+        """
+        Advance vehicle along its trajectory by one time step.
+        """
+        if self.t_idx < len(self.trajectory):
+            self.x, self.y = self.trajectory[self.t_idx]
+            self.t_idx += 1
+        else:
+            # Vehicle reached end of trajectory → stay at last position
+            self.x, self.y = self.trajectory[-1]
 
 
 @dataclass
@@ -186,6 +199,10 @@ class UavVecWorld:
         }
         """
         self.t += 1
+        # --- 0. Update vehicle positions from trajectories ---
+        for v in self.vehicles:
+            v.step()
+
 
         # --- 1. Harvest energy ---
         for uav in self.uavs:                 
@@ -272,7 +289,15 @@ class UavVecWorld:
             k = poisson_arrivals(v.lam)
             v.last_generated_tasks = k
             veh_tasks[v.vid] = k
-            rsu_vehicle_map[v.rsu_id].append(v)
+            distances = np.array([                       #finding the nearest RSU and mapping the vehicle to it 
+                (v.x - rsu.x) ** 2 + (v.y - rsu.y) ** 2
+                for rsu in self.rsus
+            ])
+            rsu_id = int(np.argmin(distances))
+
+            rsu_vehicle_map[rsu_id].append(v)
+
+
 
         rsu_trans_delay = {r.rid: 0.0 for r in self.rsus}
 
